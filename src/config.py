@@ -14,13 +14,22 @@ import crypto  # 同目录下的加密模块
 
 
 def default_session_file() -> str:
-    """猜测 MobaXterm 导出的 .moba 会话文件默认位置。
+    """猜测 MobaXterm 导出的 .moba 会话文件。
 
-    按 MobaXterm 的实际安装布局推导：%APPDATA%\\MobaXterm\\home\\.ssh\\
-    （便携版把 MobaXterm 装在别处时，用户可在「设置」里手动指定）。
+    先按 MobaXterm 的常规布局找 %APPDATA%\\MobaXterm\\home\\.ssh\\；
+    若该目录里有 .moba 文件，取最新修改的那个——因为 .moba 文件名由用户
+    在 MobaXterm 里自定义（不一定是 session.moba），写死名字会找不到。
+    找不到时返回一个不存在的占位路径，由用户在设置里指定。
     """
     base = os.environ.get("APPDATA") or str(Path.home())
-    return str(Path(base) / "MobaXterm" / "home" / ".ssh" / "session.moba")
+    ssh_dir = Path(base) / "MobaXterm" / "home" / ".ssh"
+    if ssh_dir.is_dir():
+        candidates = [p for p in ssh_dir.glob("*.moba") if p.is_file()]
+        if candidates:
+            # 按修改时间取最新的
+            newest = max(candidates, key=lambda p: p.stat().st_mtime)
+            return str(newest)
+    return str(ssh_dir / "session.moba")
 
 
 DEFAULTS = {
@@ -54,6 +63,12 @@ def load_config() -> dict:
     # 否则模块导入时就固化了 %APPDATA%，运行时改环境变量不生效。
     if not merged.get("session_file_path"):
         merged["session_file_path"] = default_session_file()
+    elif not os.path.exists(merged["session_file_path"]):
+        # 磁盘上的路径已失效（例如 .moba 被重命名/删除）：
+        # 回退到自动探测，避免用户看到"未找到会话文件"却不知为何
+        fallback = default_session_file()
+        if os.path.exists(fallback):
+            merged["session_file_path"] = fallback
     return merged
 
 

@@ -1,5 +1,6 @@
 import os
 import sys
+import shutil
 import tempfile
 import unittest
 from unittest import mock
@@ -45,3 +46,57 @@ class TestConfig(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSessionFileDiscovery(unittest.TestCase):
+    """默认 .moba 路径应自动探测，而不是写死某个文件名。
+
+    背景：.moba 文件名由用户在 MobaXterm 里自定义（实测为 ubuntu_sever.moba），
+    写死名字会导致用户看到"未找到会话文件"。
+    """
+
+    def _make_appdata(self, tmp, moba_name="my_server.moba"):
+        ssh_dir = os.path.join(tmp, "MobaXterm", "home", ".ssh")
+        os.makedirs(ssh_dir, exist_ok=True)
+        target = os.path.join(ssh_dir, moba_name)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("s =  #109#0%h%22%u%%-1%-1%\n")
+        return ssh_dir, target
+
+    def test_discovers_existing_moba_file(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            _, target = self._make_appdata(tmp, "ubuntu_sever.moba")
+            with mock.patch.dict(os.environ, {"APPDATA": tmp}, clear=False):
+                path = cfg.default_session_file()
+            self.assertEqual(os.path.normpath(path), os.path.normpath(target))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_falls_back_when_dir_missing(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            with mock.patch.dict(os.environ, {"APPDATA": tmp}, clear=False):
+                path = cfg.default_session_file()
+            self.assertIn(".ssh", path)
+            self.assertFalse(os.path.exists(path))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_stale_config_path_falls_back_to_discovery(self):
+        """磁盘上的路径失效时应回退到自动探测。"""
+        tmp = tempfile.mkdtemp()
+        try:
+            _, target = self._make_appdata(tmp, "real.moba")
+            with mock.patch.dict(os.environ, {"APPDATA": tmp}, clear=False):
+                data = cfg.load_config()
+                data["session_file_path"] = os.path.join(tmp, "gone.moba")
+                cfg.save_config(data)
+                reloaded = cfg.load_config()
+            self.assertEqual(
+                os.path.normpath(reloaded["session_file_path"]),
+                os.path.normpath(target),
+                "失效路径未回退到自动探测",
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)

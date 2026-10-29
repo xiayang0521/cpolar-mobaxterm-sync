@@ -6,6 +6,7 @@
 - start_tray：Windows 系统托盘（ctypes），右键菜单「立即同步 / 退出」。
 """
 
+import datetime
 import os
 import sys
 import threading
@@ -72,10 +73,132 @@ def make_sync_func(config):
     return sync
 
 
+class SyncScheduler:
+    """定时同步调度器。
+
+    设计要点：用 Event.wait() 而非 time.sleep()，因此可以随时被唤醒——
+    改了间隔、想立即同步一次、或要停止，都能立刻生效，不必等当前周期跑完。
+
+    相比原先的无限 sleep 循环，解决了三个问题：
+    - 改「自动同步间隔」后不必重启程序（等待中的计时会被唤醒重算）
+    - 能在界面上显示「下次同步时间」
+    - 能干净停止（线程随 stop() 退出，不留后台残留）
+    """
+
+    def __init__(self, config, sync_func, notify=None, on_result=None,
+                 interval_sec=None):
+        self.config = config
+        self.sync_func = sync_func
+        self.notify = notify          # 托盘气泡通知
+        self.on_result = on_result    # 结果回调（GUI 刷新状态栏用）
+        # interval_sec：仅供测试注入秒级间隔；一旦用户/代码显式改过配置，
+        # 就以配置为准（否则设置窗口里改间隔不会生效）。
+        self._interval_override = interval_sec
+        self._override_cleared = False
+        self._thread = None
+        self._wake = threading.Event()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._next_run_at = None      # datetime，下一次同步的时间点
+
+    # ---- 生命周期 ----
+
+    def start(self):
+        """启动调度线程（幂等）。"""
+        if self._thread and self._thread.is_alive():
+            return self._thread
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        return self._thread
+
+    def stop(self, timeout=2.0):
+        """停止调度线程并等待其退出。"""
+        self._stop.set()
+        self._wake.set()
+        thread = self._thread
+        if thread and thread.is_alive():
+            thread.join(timeout=timeout)
+        self._thread = None
+        self._next_run_at = None
+
+    def is_running(self):
+        return bool(self._thread and self._thread.is_alive())
+
+    # ---- 参数 ----
+
+    def interval_seconds(self):
+        """当前配置的间隔（秒）；最小 1 秒。
+
+        优先级：显式设置过的配置 > 测试注入的 override > 配置默认值。
+        """
+        if self._interval_override is not None and not self._override_cleared:
+            return max(1, int(self._interval_override))
+        try:
+            minutes = int(self.config.get("auto_sync_interval_min", 30))
+        except (TypeError, ValueError):
+            minutes = 30
+        return max(1, minutes) * 60
+
+    def set_interval_minutes(self, minutes):
+        """修改间隔（分钟）并立即让等待中的计时重新计算。"""
+        self.config["auto_sync_interval_min"] = max(1, int(minutes))
+        # 用户显式改过间隔后，测试注入的 override 不再生效
+        self._override_cleared = True
+        self._wake.set()
+
+    def next_run_at(self):
+        """下次同步的时间点；未运行时返回 None。"""
+        with self._lock:
+            return self._next_run_at
+
+    def trigger_now(self):
+        """立即触发一次同步（不改变原有节奏），返回 (ok, msg)。"""
+        return self._run_once()
+
+    # ---- 内部 ----
+
+    def _loop(self):
+        while not self._stop.is_set():
+            delay = self.interval_seconds()
+            with self._lock:
+                self._next_run_at = datetime.datetime.now() + datetime.timedelta(
+                    seconds=delay
+                )
+            # 用 wait 而非 sleep：set() 会立刻打断等待，用于重算间隔
+            if self._wake.wait(timeout=delay):
+                self._wake.clear()
+                continue    # 间隔可能变了，重新计算后再等
+            if self._stop.is_set():
+                break
+            self._run_once()
+
+    def _run_once(self):
+        """执行一次同步，全程兜住异常，保证调度线程不会因一次失败而死掉。"""
+        try:
+            ok, msg = self.sync_func(
+                self.config.get("selected_session", ""), interactive=False
+            )
+        except Exception as e:
+            ok, msg = False, f"同步异常：{e}"
+        if self.notify:
+            try:
+                self.notify(msg, "cpolar 同步")
+            except Exception:
+                pass
+        if self.on_result:
+            try:
+                self.on_result(ok, msg)
+            except Exception:
+                pass
+        return ok, msg
+
+
 def start_auto_sync(config, sync_func, notify=None, interval_sec=None):
     """启动后台定时同步线程（daemon）。notify 用于托盘气泡/日志。
 
     interval_sec：仅供测试注入秒级间隔；正常情况取配置里的分钟数。
+    保留此函数是为了兼容既有调用方；新代码建议直接用 SyncScheduler。
     """
     if interval_sec is None:
         interval_sec = max(1, int(config.get("auto_sync_interval_min", 30))) * 60
@@ -214,7 +337,8 @@ if _HAS_WIN:  # pragma: no cover - 仅在 Windows 上定义
     NIF_INFO = 0x10
     ID_TRAY = 1
     ID_SYNC = 1001
-    ID_QUIT = 1002
+    ID_SHOW = 1002
+    ID_QUIT = 1003
 
     # 部分类型在 wintypes 中缺失（随 Python 版本变化），补齐别名
     if not hasattr(wintypes, "HCURSOR"):
@@ -314,9 +438,16 @@ if _HAS_WIN:  # pragma: no cover - 仅在 Windows 上定义
         kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 
     class _TrayApp:
-        def __init__(self, config, sync_func):
+        def __init__(self, config, sync_func, on_show_window=None, scheduler=None,
+                     on_quit=None):
             self.config = config
             self.sync_func = sync_func
+            # 回调：从托盘恢复 GUI 窗口。由 GUI 侧注入（跨线程需自行调度）
+            self.on_show_window = on_show_window
+            # 回调：请求退出程序。由 GUI 侧注入（跨线程需自行调度）
+            self.on_quit = on_quit
+            # 调度器：用于「立即同步」后刷新托盘提示里的下次同步时间
+            self.scheduler = scheduler
             self.user32 = ctypes.windll.user32
             self.shell32 = ctypes.windll.shell32
             self.kernel32 = ctypes.windll.kernel32
@@ -334,12 +465,16 @@ if _HAS_WIN:  # pragma: no cover - 仅在 Windows 上定义
                         self._show_menu()
                     elif event == 0x201:  # WM_LBUTTONUP -> 立即同步
                         self._do_sync()
+                    elif event == 0x203:  # WM_LBUTTONDBLCLK -> 显示主窗口
+                        self._show_window()
                 elif msg == 0x111:  # WM_COMMAND
                     cmd = wparam & 0xFFFF
                     if cmd == ID_SYNC:
                         self._do_sync()
+                    elif cmd == ID_SHOW:
+                        self._show_window()
                     elif cmd == ID_QUIT:
-                        self._quit()
+                        self._request_quit()
                 elif msg in (0x10, 0x2):  # WM_CLOSE / WM_DESTROY
                     self._quit()
             except Exception:
@@ -348,6 +483,32 @@ if _HAS_WIN:  # pragma: no cover - 仅在 Windows 上定义
 
                 traceback.print_exc()
             return self.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        def _show_window(self):
+            """从托盘恢复主窗口。"""
+            if self.on_show_window:
+                try:
+                    self.on_show_window()
+                except Exception:
+                    import traceback
+
+                    traceback.print_exc()
+
+        def _request_quit(self):
+            """请求退出程序。
+
+            托盘消息循环在后台线程，不能直接销毁 Tk 窗口（Tk 非线程安全），
+            必须交回主线程处理。GUI 未接管时（例如纯托盘模式）才直接退出。
+            """
+            if self.on_quit:
+                try:
+                    self.on_quit()
+                    return
+                except Exception:
+                    import traceback
+
+                    traceback.print_exc()
+            self._quit()
 
         def _do_sync(self):
             ok, msg = self.sync_func(
@@ -371,6 +532,7 @@ if _HAS_WIN:  # pragma: no cover - 仅在 Windows 上定义
 
         def _show_menu(self):
             hmenu = self.user32.CreatePopupMenu()
+            self.user32.AppendMenuW(hmenu, 0x0, ID_SHOW, "显示主窗口")
             self.user32.AppendMenuW(hmenu, 0x0, ID_SYNC, "立即同步")
             self.user32.AppendMenuW(hmenu, 0x0, ID_QUIT, "退出")
             self.user32.SetForegroundWindow(self.hwnd)
@@ -451,24 +613,59 @@ if _HAS_WIN:  # pragma: no cover - 仅在 Windows 上定义
             self._add_icon()
             self._message_loop()
 
+        def start_in_background(self):
+            """在后台线程里跑托盘消息循环，返回该线程。
 
-def start_tray(config, sync_func, minimized=False):
-    """启动系统托盘 + 后台自动同步。非 Windows 或初始化失败时降级。"""
-    start_auto_sync(config, sync_func)
-    if _HAS_WIN:  # pragma: no cover
+            必须在独立线程执行：GUI 模式下 Tk 的 mainloop() 占用主线程，
+            而 Win32 消息循环是阻塞式的，两者不能同时跑在一个线程里。
+            """
+            thread = threading.Thread(target=self.run, daemon=True)
+            thread.start()
+            return thread
+
+        def stop(self):
+            """移除托盘图标并结束消息循环。"""
+            self._quit()
+
+
+def create_tray(config, sync_func, on_show_window=None, scheduler=None, on_quit=None):
+    """创建托盘应用对象（不启动）。失败返回 None。
+
+    调用方负责决定何时/在哪个线程跑它的消息循环。
+    """
+    if not _HAS_WIN:
+        return None
+    try:
+        return _TrayApp(
+            config, sync_func, on_show_window=on_show_window,
+            scheduler=scheduler, on_quit=on_quit,
+        )
+    except Exception:
+        return None
+
+
+def start_tray(config, sync_func, minimized=False, on_show_window=None, scheduler=None):
+    """启动系统托盘（阻塞）。非 Windows 或初始化失败时降级为隐藏窗口常驻。
+
+    仅在「纯托盘模式」（--minimized）下使用；
+    GUI 模式请用 create_tray() + start_in_background() 与 Tk 主循环共存。
+    """
+    if scheduler is None:
+        scheduler = SyncScheduler(config, sync_func)
+        scheduler.start()
+
+    app = create_tray(config, sync_func, on_show_window=on_show_window, scheduler=scheduler)
+    if app is not None:
         try:
-            _TrayApp(config, sync_func).run()
+            app.run()   # 阻塞消息循环
             return
         except Exception:
             pass
+
     # 降级：用 tkinter 隐藏窗口常驻（仅 Windows 有 tkinter）
     if _tk_available():
         import tkinter as tk
-        from tkinter import messagebox
 
         root = tk.Tk()
         root.withdraw()
-        messagebox.showinfo(
-            "提示", "系统托盘不可用（非 Windows 或初始化失败），已转为后台自动同步（窗口最小化常驻）。"
-        )
         root.mainloop()
