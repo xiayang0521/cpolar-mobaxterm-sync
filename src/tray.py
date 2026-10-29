@@ -1,0 +1,474 @@
+"""同步编排、自动同步、系统托盘与开机启动（仅依赖标准库）。
+
+- make_sync_func：核心编排（cpolar 读取 → .moba 定点更新），interactive 控制是否弹窗确认。
+- start_auto_sync：后台定时同步线程（无 GUI 环境静默写入 + 通知）。
+- set_startup：用 schtasks 注册/注销开机启动。
+- start_tray：Windows 系统托盘（ctypes），右键菜单「立即同步 / 退出」。
+"""
+
+import os
+import sys
+import threading
+import time
+
+import config as cfg
+import cpolar_client as cc
+import mobaxterm as mb
+
+
+def _tk_available():
+    try:
+        import tkinter  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def make_sync_func(config):
+    """返回一个 sync(label='', interactive=True) -> (ok, msg)。"""
+
+    def sync(label="", interactive=True):
+        moba = mb.find_session_file(config.get("session_file_path", ""))
+        if not moba:
+            return False, "未找到会话文件(.moba)，请在设置里指定路径"
+
+        # 1) 读取 cpolar 当前 SSH 隧道地址/端口
+        try:
+            client = cc.CpolarClient(
+                config.get("cpolar_base_url", "http://127.0.0.1:9200"),
+                config.get("cpolar_email", ""),
+                cfg.get_password() or "",
+                source=config.get("cpolar_source", "dashboard"),
+            )
+            host, port = client.get_ssh_tunnel("ssh")
+        except cc.CpolarError as e:
+            return False, str(e)
+
+        # 2) 预览定点替换
+        try:
+            preview = mb.update_session(moba, host, port, label=label or None)
+        except ValueError as e:
+            return False, str(e)
+
+        # 3) 手动模式弹窗确认；自动/托盘模式静默
+        if interactive and _tk_available():
+            import tkinter as tk
+            from tkinter import messagebox
+
+            ok = messagebox.askyesno(
+                "确认修改 .moba 会话",
+                f"会话：{preview['label']}\n\n改前：\n{preview['old_line']}\n\n改后：\n{preview['new_line']}\n\n确定写入？",
+            )
+            if not ok:
+                return False, "已取消"
+
+        # 4) 备份并写回
+        try:
+            backup = mb.apply_update(moba, preview["old_line"], preview["new_line"])
+        except ValueError as e:
+            return False, str(e)
+        return True, f"已更新 {preview['label']} → {host}:{port}（备份：{backup}）"
+
+    return sync
+
+
+def start_auto_sync(config, sync_func, notify=None, interval_sec=None):
+    """启动后台定时同步线程（daemon）。notify 用于托盘气泡/日志。
+
+    interval_sec：仅供测试注入秒级间隔；正常情况取配置里的分钟数。
+    """
+    if interval_sec is None:
+        interval_sec = max(1, int(config.get("auto_sync_interval_min", 30))) * 60
+    interval = max(1, int(interval_sec))
+
+    def loop():
+        while True:
+            time.sleep(interval)
+            try:
+                ok, msg = sync_func(config.get("selected_session", ""), interactive=False)
+            except Exception as e:
+                # 绝不能让异常杀死后台线程，否则自动同步会静默失效
+                msg = f"同步异常：{e}"
+                ok = False
+            if notify:
+                notify(msg, "cpolar 同步")
+
+    t = threading.Thread(target=loop, daemon=True)
+    t.start()
+    return t
+
+
+def _exe_path():
+    """返回用于开机启动的可执行文件路径（**不带引号**）。
+
+    打包成 exe 时返回 exe 本身；
+    未打包时返回主程序脚本路径（真正的命令行由 _startup_command 组装）。
+    """
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    # 只有当 argv[0] 确实是本项目的主程序时才能用它；
+    # 否则（例如被 `python -m unittest` 调起时 argv[0] 是测试运行器路径）
+    # 回退到 src/main.py，否则注册表项会指向一个错误的目标。
+    script = sys.argv[0] if sys.argv and sys.argv[0] else ""
+    if script and not script.startswith("-"):
+        script = os.path.abspath(script)
+        if os.path.basename(script).lower() == "main.py":
+            return script
+    # 回退：定位到本模块同级的 main.py
+    fallback = os.path.join(os.path.dirname(os.path.abspath(__file__)), "main.py")
+    return fallback if os.path.exists(fallback) else sys.executable
+
+
+def _startup_registry_path():
+    """开机启动注册表位置：HKCU\\...\\Run（当前用户，无需管理员权限）。"""
+    return "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+
+
+def _startup_command():
+    """注册表里写入的启动命令：托盘模式静默启动。
+
+    引号只能加一层——曾因 _exe_path 已带引号、这里又套一层，
+    写出 `""python.exe" "main.py"" --minimized`，Windows 登录时无法解析。
+    """
+    exe = _exe_path()
+    if getattr(sys, "frozen", False):
+        return f'"{exe}" --minimized'
+    if exe.lower().endswith(".py"):
+        # 未打包：必须带上解释器，否则注册表项只会指向 .py 文件无法执行
+        return f'"{sys.executable}" "{exe}" --minimized'
+    return f'"{exe}" --minimized'
+
+
+def startup_registered():
+    """检查注册表里是否已存在开机启动项；返回 bool。"""
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover - 非 Windows
+        return False
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, _startup_registry_path(), 0, winreg.KEY_READ
+        ) as key:
+            try:
+                winreg.QueryValueEx(key, "CpolarMobaSync")
+                return True
+            except FileNotFoundError:
+                return False
+    except OSError:
+        return False
+
+
+def set_startup(enabled):
+    """注册/注销开机启动。
+
+    用注册表 Run 键（winreg，标准库）而非 schtasks 外部命令——
+    理由：① 不依赖外部 exe，不会因策略拦截而失败；
+          ② 不会闪控制台黑框；③ HKCU 键无需管理员权限。
+
+    返回 (ok, message)，调用方应把结果告知用户，不静默失败。
+    """
+    try:
+        import winreg
+    except ImportError:  # pragma: no cover - 非 Windows
+        return False, "仅支持 Windows 设置开机启动"
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            _startup_registry_path(),
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as key:
+            if enabled:
+                winreg.SetValueEx(key, "CpolarMobaSync", 0, winreg.REG_SZ, _startup_command())
+                return True, "已开启开机启动（登录后自动运行）"
+            try:
+                winreg.DeleteValue(key, "CpolarMobaSync")
+            except FileNotFoundError:
+                pass  # 本来就没开，视为成功
+            return True, "已关闭开机启动"
+    except OSError as e:
+        return False, f"设置开机启动失败：{e}"
+
+
+# ---------------------------------------------------------------------------
+# Windows 系统托盘（ctypes）；非 Windows 或初始化失败时降级为隐藏窗口常驻
+# ---------------------------------------------------------------------------
+
+try:
+    import ctypes
+    from ctypes import wintypes
+
+    _HAS_WIN = True
+except Exception:  # pragma: no cover
+    _HAS_WIN = False
+
+if _HAS_WIN:  # pragma: no cover - 仅在 Windows 上定义
+    WM_TRAYICON = 0x8000 + 1
+    NIM_ADD = 0x0
+    NIM_MODIFY = 0x1
+    NIM_DELETE = 0x2
+    NIF_MESSAGE = 0x1
+    NIF_ICON = 0x2
+    NIF_TIP = 0x4
+    NIF_INFO = 0x10
+    ID_TRAY = 1
+    ID_SYNC = 1001
+    ID_QUIT = 1002
+
+    # 部分类型在 wintypes 中缺失（随 Python 版本变化），补齐别名
+    if not hasattr(wintypes, "HCURSOR"):
+        wintypes.HCURSOR = ctypes.c_void_p
+
+    # 窗口过程函数指针类型（wintypes 不含 WNDPROC，需自行用 WINFUNCTYPE 定义）
+    WNDPROC = ctypes.WINFUNCTYPE(
+        wintypes.LPARAM,
+        wintypes.HWND,
+        wintypes.UINT,
+        wintypes.WPARAM,
+        wintypes.LPARAM,
+    )
+
+    class _NOTIFYICONDATAW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("hWnd", wintypes.HWND),
+            ("uID", wintypes.UINT),
+            ("uFlags", wintypes.UINT),
+            ("uCallbackMessage", wintypes.UINT),
+            ("hIcon", wintypes.HICON),
+            ("szTip", wintypes.WCHAR * 128),
+            ("dwState", wintypes.DWORD),
+            ("dwStateMask", wintypes.DWORD),
+            ("szInfo", wintypes.WCHAR * 256),
+            ("uTimeout", wintypes.UINT),
+            ("szInfoTitle", wintypes.WCHAR * 64),
+            ("dwInfoFlags", wintypes.DWORD),
+            ("guidItem", ctypes.c_byte * 16),
+            ("hBalloonIcon", wintypes.HICON),
+        ]
+
+    class _WNDCLASSW(ctypes.Structure):
+        _fields_ = [
+            ("style", wintypes.UINT),
+            ("lpfnWndProc", WNDPROC),
+            ("cbClsExtra", wintypes.INT),
+            ("cbWndExtra", wintypes.INT),
+            ("hInstance", wintypes.HINSTANCE),
+            ("hIcon", wintypes.HICON),
+            ("hCursor", wintypes.HCURSOR),
+            ("hbrBackground", wintypes.HBRUSH),
+            ("lpszMenuName", wintypes.LPCWSTR),
+            ("lpszClassName", wintypes.LPCWSTR),
+        ]
+
+    def _declare_win32_apis(user32, shell32, kernel32):
+        """显式声明 Win32 API 的 argtypes/restype。
+
+        必须显式声明的原因：ctypes 默认把 Python int 当 32 位 c_int 传，
+        而 LPARAM/WPARAM/HANDLE 在 64 位 Windows 上是 8 字节，
+        不声明会导致「int too long to convert」并让消息循环崩溃。
+        """
+        user32.DefWindowProcW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+        ]
+        user32.DefWindowProcW.restype = wintypes.LPARAM
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, ctypes.c_void_p,
+        ]
+        user32.RegisterClassW.restype = wintypes.ATOM
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(_WNDCLASSW)]
+        user32.LoadIconW.restype = wintypes.HICON
+        # 第二个参数是资源 ID（MAKEINTRESOURCE 语义，实为整数指针），
+        # 声明为 c_void_p 才能直接传整数 ID；声明成 LPCWSTR 会报
+        # "'int' object cannot be interpreted as ctypes.c_wchar_p"
+        user32.LoadIconW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        user32.PostQuitMessage.argtypes = [ctypes.c_int]
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.GetMessageW.argtypes = [
+            ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT,
+        ]
+        user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+        user32.CreatePopupMenu.restype = wintypes.HMENU
+        user32.AppendMenuW.argtypes = [
+            wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR,
+        ]
+        user32.TrackPopupMenu.restype = wintypes.BOOL
+        user32.TrackPopupMenu.argtypes = [
+            wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, wintypes.HWND, ctypes.c_void_p,
+        ]
+        user32.DestroyMenu.argtypes = [wintypes.HMENU]
+        shell32.Shell_NotifyIconW.restype = wintypes.BOOL
+        shell32.Shell_NotifyIconW.argtypes = [
+            wintypes.DWORD, ctypes.POINTER(_NOTIFYICONDATAW),
+        ]
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+
+    class _TrayApp:
+        def __init__(self, config, sync_func):
+            self.config = config
+            self.sync_func = sync_func
+            self.user32 = ctypes.windll.user32
+            self.shell32 = ctypes.windll.shell32
+            self.kernel32 = ctypes.windll.kernel32
+            _declare_win32_apis(self.user32, self.shell32, self.kernel32)
+            self.hwnd = None
+            self.hicon = None
+            self.wndclass_name = "CpolarMobaSyncTray"
+            self._wndproc = None  # 保持引用，防止被 GC
+
+        def _wnd_proc(self, hwnd, msg, wparam, lparam):
+            try:
+                if msg == WM_TRAYICON:
+                    event = lparam & 0xFFFF
+                    if event == 0x205:  # WM_RBUTTONUP -> 右键菜单
+                        self._show_menu()
+                    elif event == 0x201:  # WM_LBUTTONUP -> 立即同步
+                        self._do_sync()
+                elif msg == 0x111:  # WM_COMMAND
+                    cmd = wparam & 0xFFFF
+                    if cmd == ID_SYNC:
+                        self._do_sync()
+                    elif cmd == ID_QUIT:
+                        self._quit()
+                elif msg in (0x10, 0x2):  # WM_CLOSE / WM_DESTROY
+                    self._quit()
+            except Exception:
+                # 回调里抛异常会被 ctypes 吞掉并打印栈，掩盖真实问题；显式记录
+                import traceback
+
+                traceback.print_exc()
+            return self.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        def _do_sync(self):
+            ok, msg = self.sync_func(
+                self.config.get("selected_session", ""), interactive=False
+            )
+            self.notify(msg, "cpolar 同步")
+
+        def notify(self, msg, title="cpolar 同步"):
+            nid = _NOTIFYICONDATAW()
+            nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+            nid.hWnd = self.hwnd
+            nid.uID = ID_TRAY
+            nid.uFlags = NIF_ICON | NIF_TIP | NIF_INFO
+            nid.hIcon = self.hicon
+            nid.uTimeout = 4000
+            nid.dwInfoFlags = 0x1  # NIIF_INFO
+            # 注意：c_wchar 数组字段读出来是 str，必须整串赋值，不能按项赋值
+            nid.szInfo = (msg or "")[:255]
+            nid.szInfoTitle = (title or "")[:63]
+            self.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+
+        def _show_menu(self):
+            hmenu = self.user32.CreatePopupMenu()
+            self.user32.AppendMenuW(hmenu, 0x0, ID_SYNC, "立即同步")
+            self.user32.AppendMenuW(hmenu, 0x0, ID_QUIT, "退出")
+            self.user32.SetForegroundWindow(self.hwnd)
+            pt = wintypes.POINT()
+            self.user32.GetCursorPos(ctypes.byref(pt))
+            self.user32.TrackPopupMenu(
+                hmenu, 0x100, pt.x, pt.y, 0, self.hwnd, None
+            )
+            self.user32.DestroyMenu(hmenu)
+
+        def _register_class(self):
+            wc = _WNDCLASSW()
+            wc.style = 0
+            wc.lpfnWndProc = self._get_wndproc()
+            wc.hInstance = self.kernel32.GetModuleHandleW(None)
+            wc.lpszClassName = self.wndclass_name
+            self.user32.RegisterClassW(ctypes.byref(wc))
+            self._wc = wc
+
+        def _get_wndproc(self):
+            prototype = ctypes.WINFUNCTYPE(
+                wintypes.LPARAM,
+                wintypes.HWND,
+                wintypes.UINT,
+                wintypes.WPARAM,
+                wintypes.LPARAM,
+            )
+            self._wndproc = prototype(self._wnd_proc)
+            return self._wndproc
+
+        def _create_window(self):
+            self.hwnd = self.user32.CreateWindowExW(
+                0,
+                self.wndclass_name,
+                "cpolar",
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                self.kernel32.GetModuleHandleW(None),
+                0,
+            )
+            self.user32.ShowWindow(self.hwnd, 0)  # SW_HIDE
+
+        def _add_icon(self):
+            self.hicon = self.user32.LoadIconW(None, 32512)  # IDI_APPLICATION
+            nid = _NOTIFYICONDATAW()
+            nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+            nid.hWnd = self.hwnd
+            nid.uID = ID_TRAY
+            nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+            nid.uCallbackMessage = WM_TRAYICON
+            nid.hIcon = self.hicon
+            # 整串赋值：c_wchar 数组字段读出来是 str，不能按项赋值
+            nid.szTip = "cpolar → MobaXterm 同步"[:127]
+            self.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
+
+        def _message_loop(self):
+            msg = wintypes.MSG()
+            while self.user32.GetMessageW(ctypes.byref(msg), 0, 0, 0) > 0:
+                self.user32.TranslateMessage(ctypes.byref(msg))
+                self.user32.DispatchMessageW(ctypes.byref(msg))
+
+        def _quit(self):
+            nid = _NOTIFYICONDATAW()
+            nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+            nid.hWnd = self.hwnd
+            nid.uID = ID_TRAY
+            self.shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+            self.user32.PostQuitMessage(0)
+
+        def run(self):
+            self._register_class()
+            self._create_window()
+            self._add_icon()
+            self._message_loop()
+
+
+def start_tray(config, sync_func, minimized=False):
+    """启动系统托盘 + 后台自动同步。非 Windows 或初始化失败时降级。"""
+    start_auto_sync(config, sync_func)
+    if _HAS_WIN:  # pragma: no cover
+        try:
+            _TrayApp(config, sync_func).run()
+            return
+        except Exception:
+            pass
+    # 降级：用 tkinter 隐藏窗口常驻（仅 Windows 有 tkinter）
+    if _tk_available():
+        import tkinter as tk
+        from tkinter import messagebox
+
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(
+            "提示", "系统托盘不可用（非 Windows 或初始化失败），已转为后台自动同步（窗口最小化常驻）。"
+        )
+        root.mainloop()
