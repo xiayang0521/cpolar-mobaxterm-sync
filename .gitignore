@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# PyInstaller 打包产物
+build/
+dist/
+*.manifest
+
+# 测试与缓存
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 本地配置与凭据（绝不应提交）
+config.json
+credentials.enc
+credentials.key
+*.moba
+*.moba.bak_*
