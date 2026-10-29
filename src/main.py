@@ -92,14 +92,24 @@ def _start_tray_thread(tray_app):
 
 
 def _sync_startup_state(config):
-    """把注册表中的开机启动项与配置对齐；失败只记录不阻断启动。"""
+    """把注册表中的开机启动项与配置对齐。
+
+    对齐规则是**单向补齐**，不是双向强制一致：
+    - 配置为 True、注册表没有 → 补注册（用户想开但没生效）
+    - 配置为 False、注册表有 → **不动**。因为"配置为 False"可能只是
+      配置被重置/换机，而注册表项是用户实际生效的设置；
+      只有用户在设置窗口里明确取消勾选时，才应该删注册表（见 gui.SettingsWindow.save）。
+
+    这样避免程序一启动就把用户已生效的开机启动悄悄删掉。
+    """
     try:
         desired = bool(config.get("start_with_windows", False))
         actual = tray.startup_registered()
-        if desired == actual:
-            return
-        ok, msg = tray.set_startup(desired)
-        print(f"[开机启动] {'已对齐' if ok else '对齐失败：' + msg}")
+        if desired and not actual:
+            ok, msg = tray.set_startup(True)
+            print(f"[开机启动] {'已补注册' if ok else '补注册失败：' + msg}")
+        elif actual and not desired:
+            print("[开机启动] 注册表已存在但配置为关闭，保留现状（如需关闭请在设置里取消勾选）")
     except Exception as e:  # pragma: no cover - 开机启动是附加功能
         print(f"[开机启动] 检查异常（不影响主流程）：{e}")
 
