@@ -119,8 +119,13 @@ class TestStartupReconcile(unittest.TestCase):
         self.assertTrue(tray.startup_registered(), "启动时未对齐注册表状态")
         tray.set_startup(False)
 
-    def test_main_reconcile_removes_when_config_disabled(self):
-        """配置为关闭但注册表仍存在时，应把注册项清掉。"""
+    def test_main_reconcile_keeps_registry_when_config_disabled(self):
+        """配置为关闭但注册表仍存在时，应**保留**注册项。
+
+        为什么不删：配置里的开关可能只是被重置/换机，而注册表项才是
+        用户实际生效的设置。程序一启动就把已生效的开机启动悄悄删掉，
+        属于破坏性行为。真正要关闭只能由用户在设置里明确取消勾选。
+        """
         import importlib
         import main as main_mod
 
@@ -128,8 +133,23 @@ class TestStartupReconcile(unittest.TestCase):
         tray.set_startup(True)
         config = {"start_with_windows": False}
         main_mod._sync_startup_state(config)
-        self.assertFalse(tray.startup_registered(), "关闭状态未对齐")
+        self.assertTrue(
+            tray.startup_registered(),
+            "配置为关闭时不应擅自删除已生效的注册项",
+        )
         tray.set_startup(False)
+
+    def test_settings_explicit_disable_removes_registry(self):
+        """用户在设置里明确取消勾选时，注册项应被删除。"""
+        import importlib
+        import main as main_mod
+
+        importlib.reload(main_mod)
+        tray.set_startup(True)
+        # 设置窗口保存路径：先改配置，再按开关状态调用 set_startup
+        ok, _ = tray.set_startup(False)
+        self.assertTrue(ok)
+        self.assertFalse(tray.startup_registered(), "明确关闭后注册项应被删除")
 
 
 class TestStartupCommandExecutable(unittest.TestCase):
